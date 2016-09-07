@@ -1,6 +1,6 @@
 package raft
 
-trait RPC[A] {
+trait RPC[+A] {
   def term: Term
 }
 
@@ -12,12 +12,12 @@ case class RequestVoteRPC(
 ) extends RPC[Nothing]
 
 case class AppendEntriesRPC[A](
-    term: Term,
-    leaderId: NodeId,
-    prevLogIndex: LogIndex,
-    prevLogTerm: Term,
-    entries: Vector[LogEntry[A]],
-    leaderCommit: LogIndex
+  term: Term,
+  leaderId: NodeId,
+  prevLogIndex: LogIndex,
+  prevLogTerm: Term,
+  entries: Vector[LogEntry[A]],
+  leaderCommit: LogIndex
 ) extends RPC[A] {
   def isHeartbeat = entries.isEmpty
 }
@@ -42,12 +42,14 @@ object Heartbeat {
 
 }
 
+trait RPCResponse
+
 case class RequestVoteResponse(
   term: Term,
   voteGranted: Boolean
-)
+) extends RPCResponse
 
 case class AppendEntriesResponse(
   term: Term,
   success: Boolean
-)
+) extends RPCResponse

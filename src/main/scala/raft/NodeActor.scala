@@ -1,7 +1,11 @@
 package raft
 
 import akka.actor.{ Actor, ActorLogging, ActorRef, ActorSystem, Cancellable, Props, Stash }
+import scala.concurrent.Future
 import scala.concurrent.duration.{ Duration, FiniteDuration }
+import akka.pattern._
+import akka.util.Timeout
+import scala.util.Right
 
 object NodeActor {
 
@@ -9,37 +13,44 @@ object NodeActor {
     nodeId: NodeId,
     stateMachine: StateMachine[A, B],
     electionTimeout: FiniteDuration,
-    heartbeatPeriod: FiniteDuration
+    heartbeatPeriod: FiniteDuration,
+    requestTimeout: FiniteDuration
   ): Props = Props(
-    new NodeActor(nodeId, stateMachine, electionTimeout, heartbeatPeriod)
+    new NodeActor(nodeId, stateMachine, electionTimeout, heartbeatPeriod, requestTimeout)
   )
 
   def createActor[A, B](
     nodeId: NodeId,
     stateMachine: StateMachine[A, B],
     electionTimeout: FiniteDuration,
-    heartbeatPeriod: FiniteDuration
+    heartbeatPeriod: FiniteDuration,
+    requestTimeout: FiniteDuration,
+    name: String
   )(implicit actorSystem: ActorSystem): ActorRef = {
     actorSystem.actorOf(
-      props(nodeId, stateMachine, electionTimeout, heartbeatPeriod)
-    )
+      props(nodeId, stateMachine, electionTimeout, heartbeatPeriod, requestTimeout)
+    , name)
   }
 
 }
 
 class NodeActor[A, B](
-    nodeId: NodeId,
-    stateMachine: StateMachine[A, B],
-    electionTimeout: FiniteDuration,
-    heartbeatPeriod: FiniteDuration
+  nodeId: NodeId,
+  stateMachine: StateMachine[A, B],
+  electionTimeout: FiniteDuration,
+  heartbeatPeriod: FiniteDuration,
+  requestTimeout: FiniteDuration
 ) extends Actor with ActorLogging with Stash {
   require(heartbeatPeriod < electionTimeout)
+
+  implicit val _requestTimeout = Timeout( requestTimeout )
 
   /*
    * State
    */
 
-  var nodes: Map[NodeId, ActorRef] = _
+  var nodesIds: List[NodeId] = _
+  var network: Network[A] = _
 
   var currentTerm: Term = 0 //should be persistent
   var votedFor: Option[NodeId] = None //should be persistent
@@ -59,12 +70,6 @@ class NodeActor[A, B](
   var commitIndex: LogIndex = 0
   var lastApplied: LogIndex = 0
 
-  def startElectionTimeout() = {
-    electionTimeoutMessage = system.scheduler.scheduleOnce(electionTimeout) {
-      self ! ElectionTimeout
-    }
-  }
-
   /*
    * States
    */
@@ -72,8 +77,9 @@ class NodeActor[A, B](
   def receive = waitingForNodesInfo
 
   val waitingForNodesInfo: Receive = {
-    case SetNodesInfo(nodesInfo) =>
-      nodes = nodesInfo
+    case setNodesInfo: SetNodesInfo[A] =>
+      nodesIds = setNodesInfo.nodesIds
+      network = setNodesInfo.network
       unstashAll()
       context.become(startupState())
     case QueryState =>
@@ -97,12 +103,8 @@ class NodeActor[A, B](
       log.info(s"Node $nodeId received heartbeat from node ${appendEntries.leaderId} while follower")
       handleHeartbeat(leaderId, appendEntries)
     case appendEntries: AppendEntriesRPC[A] =>
-      leaderId match {
-        case Some(leaderId) =>
-        case None =>
-      }
       if (appendEntries.term < currentTerm || !checkConsistencyCondition(appendEntries)) {
-        sender() ! AppendEntriesResponse(term = currentTerm, success = false)
+        network.respond(sender(), AppendEntriesResponse(term = currentTerm, success = false))
       } else {
         resetElectionTimeout() // @TODO should also reset in the previous clause
         val conflictPoint = getConflictPoint(appendEntries)
@@ -115,8 +117,10 @@ class NodeActor[A, B](
       }
     case QueryState =>
       sender() ! Follower(leaderId, currentTerm)
+    /*
     case unhandledMessage =>
       log.info(s"Node $nodeId received unhandled message while follower: $unhandledMessage")
+      */
   }
 
   def candidate(votesGranted: Int): Receive = {
@@ -143,9 +147,13 @@ class NodeActor[A, B](
       startNewElection()
     case QueryState =>
       sender() ! Candidate(votesGranted, currentTerm)
+    /*
     case unhandledMessage =>
       log.info(s"Node $nodeId received unhandled message while candidate $unhandledMessage")
+ */
   }
+
+  var clientRequestsBuffer = Vector.empty[LogEntry[A]]
 
   def leader(nextIndex: Map[NodeId, LogIndex]): Receive = {
     case appendEntries: AppendEntriesRPC[A] =>
@@ -156,31 +164,82 @@ class NodeActor[A, B](
         context.become(follower(leaderId = Some(appendEntries.leaderId)))
         self ! appendEntries // try to append the entries afterwards
       }
-    case append: AppendEntry[A] =>
-      appendUncommitted(append.entry)
-      nodes foreach {
-        case (nodeId, node) =>
-          if (nextIndex(nodeId) <= logIndex) {
-            val nodeEntries = entriesLog.drop(logIndex) // @TODO check for off-by-one error
-            node ! AppendEntriesRPC(
-              term = currentTerm,
-              leaderId = nodeId,
-              prevLogIndex = nextIndex(nodeId),
-              prevLogTerm = entriesLog(nextIndex(nodeId).toInt).term,
-              entries = nodeEntries, leaderCommit = commitIndex
-            )
-            // @TODO retries when append fails
-          }
+    case append: AppendEntryClientRequest[A] =>
+      val uncommitedLogIndex = appendUncommitted(append.entry)
+      Future.traverse(nodesIds) {
+        case otherNodeId =>
+          context.become(leaderWaitingForFollowerResponses(nextIndex))
+          val nodeEntries = entriesLog.drop(logIndex) // @TODO check for off-by-one error
+          //if (nextIndex(otherNodeId) <= logIndex) { // @TODO uncomment
+          network.ask(otherNodeId, AppendEntriesRPC(
+            term = currentTerm,
+            leaderId = otherNodeId,
+            prevLogIndex = nextIndex(otherNodeId),
+            prevLogTerm = entriesLog(nextIndex(otherNodeId).toInt).term,
+            entries = nodeEntries,
+            leaderCommit = commitIndex
+          )).mapTo[AppendEntriesResponse]
+            .map( resp => Right(resp) )
+            .recover{ case err: Throwable => Left(err) }
+            .map( resp => SingleFollowerAppendResponse(otherNodeId, resp) )
+          //}
+      }.onSuccess { case responses =>
+          self ! AppendEntriesFollowersResponse(responses.toList, uncommitedLogIndex)
       }
     case QueryState =>
       sender() ! Leader(nodeId, currentTerm)
+    /*
     case unhandledMessage =>
       log.info(s"Received unhandled message while leader $unhandledMessage")
+ */
+  }
+
+  case class SingleFollowerAppendResponse(
+    nodeId: NodeId,
+    response: Either[Throwable, AppendEntriesResponse]
+  )
+
+  case class AppendEntriesFollowersResponse(
+    responses: List[SingleFollowerAppendResponse],
+    uncommiteEntry: LogIndex
+  ) {
+
+    def positiveResponses(): List[SingleFollowerAppendResponse] = responses.collect {
+      case x @ SingleFollowerAppendResponse(_,Right(response)) if response.success =>
+        x
+    }
+
+  }
+
+  def commitEntriesUpTo(index: LogIndex): Unit = {
+    entriesLog
+      .slice(commitIndex.toInt + 1, index.toInt + 1)
+      .foreach { logEntry =>
+        stateMachine.execute(logEntry.data)
+    }
+  }
+
+  def leaderWaitingForFollowerResponses(nextIndex: Map[Int, Long]): Receive = {
+    case responses: AppendEntriesFollowersResponse =>
+      val positiveResponses = responses.positiveResponses()
+      if(positiveResponses.size > nodesIds.size / 2) {
+        commitEntriesUpTo(responses.uncommiteEntry)
+      }
+      unstashAll()
+      context.become(leader(nextIndex))
+    case _ =>
+      stash()
   }
 
   /*
    * Methods
    */
+  def startElectionTimeout() = {
+    electionTimeoutMessage = system.scheduler.scheduleOnce(electionTimeout) {
+      self ! ElectionTimeout
+    }
+  }
+
   def startNewElection() = {
     log.info(s"Node $nodeId starting new election for term $currentTerm")
     currentTerm += 1
@@ -227,18 +286,20 @@ class NodeActor[A, B](
 
   def handleHeartbeat(leaderId: Option[NodeId], appendEntries: AppendEntriesRPC[A]): Unit = {
     leaderId match {
-      case None =>
+      case Some(currentLeader) if currentLeader == appendEntries.leaderId =>
+        log.info(s"Node $nodeId received heartbeat from previous leader $appendEntries.leaderId, staying the same")
         resetElectionTimeout()
-        log.info(s"Node $nodeId received heartbeat from a new leader $appendEntries.leaderId, setting leaderId")
-        context.become(follower(leaderId = Some(appendEntries.leaderId)))
-        sender() ! AppendEntriesResponse(term = currentTerm, true)
-      case Some(currentLeader) =>
-        if (currentLeader == appendEntries.leaderId) {
-          log.info(s"Node $nodeId received heartbeat from previous leader $appendEntries.leaderId, staying the same")
+        network.respond(sender() , AppendEntriesResponse(term = currentTerm, true))
+      case _ =>
+        if (appendEntries.term >= currentTerm /* && checkConsistencyCondition(appendEntries)*/ ) {
+          currentTerm = appendEntries.term
           resetElectionTimeout()
-          sender() ! AppendEntriesResponse(term = currentTerm, true)
+          log.info(s"Node $nodeId received heartbeat from a new leader $appendEntries.leaderId, setting leaderId")
+          votedFor = None
+          context.become(follower(leaderId = Some(appendEntries.leaderId)))
+          network.respond(sender() , AppendEntriesResponse(term = currentTerm, true))
         } else {
-          log.info("WTF? split brain?") //@TODO handle case
+          network.respond(sender() , AppendEntriesResponse(term = currentTerm, false))
         }
     }
   }
@@ -257,29 +318,34 @@ class NodeActor[A, B](
     heartbeatMessage.cancel()
   }
 
-  def appendUncommitted(entry: A): Unit = {
-    entriesLog = entriesLog :+ LogEntry(term = currentTerm, index = entriesLog.length.toLong /*@TODO is this the correct index?*/ , data = entry)
+  def appendUncommitted(entry: A): LogIndex = {
+    val newEntry = LogEntry(term = currentTerm, index = entriesLog.length.toLong /*@TODO is this the correct index?*/ , data = entry)
+    entriesLog = entriesLog :+ newEntry
+    clientRequestsBuffer = clientRequestsBuffer :+ newEntry
+    commitIndex
   }
 
   def requestVotes() = {
-    nodes foreach {
-      case (_, node) =>
-        node ! RequestVoteRPC(
-          term = currentTerm,
-          candidateId = nodeId,
-          lastLogIndex = lastLogIndex,
-          lastLogTerm = lastLogTerm
+    nodesIds foreach {
+      case otherNodeId =>
+        network.sendTo( otherNodeId,
+          RequestVoteRPC(
+            term = currentTerm,
+            candidateId = nodeId,
+            lastLogIndex = lastLogIndex,
+            lastLogTerm = lastLogTerm
+          )
         )
     }
   }
 
   def verifyMajorityOfVotes(votesGranted: Int) = {
     log.info(s"Node $nodeId verifying majority of the votes: votes granted = $votesGranted")
-    if (votesGranted > nodes.size / 2) { //@TODO verify if this is the correct predicate
+    if (votesGranted > nodesIds.size / 2) { //@TODO verify if this is the correct predicate
       log.info(s"Node $nodeId got majority of votes, becoming leader")
       cancelElectionTimeout()
       startHeartbeatMessages()
-      val nextIndex: Map[NodeId, LogIndex] = nodes.mapValues(_ => lastLogIndex + 1)
+      val nextIndex: Map[NodeId, LogIndex] = nodesIds.map(nodeId => nodeId -> (lastLogIndex + 1) ).toMap
       context.become(leader(nextIndex = nextIndex))
     } else {
       context.become(candidate(votesGranted))
@@ -288,9 +354,17 @@ class NodeActor[A, B](
 
   def sendLeaderHeartBeats() = {
     log.info(s"Node $nodeId sending leader heartbeats to other nodes")
-    nodes foreach {
-      case (_, node) =>
-        node ! Heartbeat(term = currentTerm, leaderId = nodeId, prevLogIndex = lastLogTerm, prevLogTerm = lastLogTerm, leaderCommit = commitIndex) //@TODO verify parameter values
+    nodesIds foreach {
+      case otherNodeId =>
+        network.sendTo(otherNodeId,
+          Heartbeat(
+            term = currentTerm,
+            leaderId = nodeId,
+            prevLogIndex = lastLogTerm,
+            prevLogTerm = lastLogTerm,
+            leaderCommit = commitIndex
+          ) //@TODO verify parameter values
+        )
     }
   }
 
@@ -306,32 +380,43 @@ class NodeActor[A, B](
   def handleVoteRequest(requestVote: RequestVoteRPC, candidate: ActorRef): Unit = {
     log.info(s"Node $nodeId handling vote request from node ${requestVote.candidateId}")
     if (requestVote.term >= currentTerm) {
-      currentTerm = requestVote.term
+      currentTerm = requestVote.term //??? do this even if vote is not granted?
       votedFor match {
         case Some(previousVote) =>
           log.info(s"Node $nodeId rejecting vote for node ${requestVote.candidateId} for term $currentTerm because already voted for $previousVote")
-          candidate ! RequestVoteResponse(currentTerm, false)
+          network.respond(candidate, RequestVoteResponse(currentTerm, false))
         case None =>
           log.info(s"Verifying if $nodeId's log is up to date with respect to ${requestVote.candidateId}")
           if (logIsAtLeastUpToDate(requestVote.lastLogIndex, requestVote.lastLogTerm)) {
             log.info(s"$nodeId's log is up to date w.r.t ${requestVote.candidateId}")
             resetElectionTimeout() // @TODO is this the correct place for this?
             log.info(s"Node $nodeId voting for node ${requestVote.candidateId} for term $currentTerm")
-            candidate ! RequestVoteResponse(currentTerm, true)
+            network.respond(candidate, RequestVoteResponse(currentTerm, true))
             votedFor = Some(requestVote.candidateId)
           } else {
             log.info(s"Node $nodeId rejecting vote for node ${requestVote.candidateId} for term $currentTerm because logs are not up to date")
-            candidate ! RequestVoteResponse(currentTerm, false)
+            network.respond(candidate, RequestVoteResponse(currentTerm, false))
           }
       }
     } else {
       log.info(s"Node $nodeId rejecting vote for node ${requestVote.candidateId} for term $currentTerm because candidate's term is old")
-      candidate ! RequestVoteResponse(currentTerm, false)
+      network.respond(candidate, RequestVoteResponse(currentTerm, false))
     }
+  }
+
+  override def postStop() = {
+    log.info(s"Executing post stop for $nodeId")
+    if(electionTimeoutMessage != null) {
+      electionTimeoutMessage.cancel()
+    }
+    if(heartbeatMessage != null) {
+      heartbeatMessage.cancel()
+    }
+
   }
 
 }
 
 //@TODO move this to another place
-case class SetNodesInfo(nodesInfo: Map[NodeId, ActorRef])
+case class SetNodesInfo[A](nodesIds: List[NodeId], network: Network[A])
 case object QueryState

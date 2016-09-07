@@ -1,83 +1,72 @@
 package raft
 
-import akka.actor.{ ActorRef, ActorSystem }
+import akka.actor.ActorSystem
 import akka.util.Timeout
 import org.scalatest._
-import scala.concurrent.{ ExecutionContext, Future }
+import org.scalatest.time.{ Millis, Seconds, Span }
+import scala.concurrent.Await
 import scala.concurrent.duration._
-import akka.pattern._
-import scala.util.{ Failure, Success }
 import org.scalatest.concurrent.ScalaFutures
+import scala.util.{ Failure, Success }
 
-class NodeActorSpec extends FlatSpec with Matchers with ScalaFutures {
+class NodeActorSpec extends FlatSpec with Matchers with ScalaFutures with TestUtils with TestVerifications {
 
-  def initialStateMachine(): IntNumberState = new IntNumberState()
+  implicit val timeout = Timeout(100.millis)
+  implicit val patience =
+      PatienceConfig(timeout = Span(1, Seconds), interval = Span(5, Millis))
 
-  def verifySingleLeaderAndFollowers(state: Map[NodeId, NodeState]): Boolean = {
-    val leader = state.find {
-      case (_, nodeState) =>
-        nodeState match {
-          case Leader(_, _) => true
-          case _ => false
-        }
-    }
-    leader match {
-      case Some(leader) =>
-        val others = state.filter(_ != leader)
-        val (leaderId, Leader(_, leaderTerm)) = leader
-        others.forall {
-          case (_, nodeState) =>
-            nodeState match {
-              case Follower(leaderIdOpt, followerTerm) =>
-                leaderIdOpt == Some(leaderId) && followerTerm == leaderTerm
-              case _ => false
-            }
-        }
-      case None =>
-        false
-    }
-  }
-
-  def getNodesState(nodes: Map[NodeId, ActorRef])(implicit executionContext: ExecutionContext, timeout: Timeout): Future[Map[NodeId, NodeState]] = {
-    Future.traverse(nodes) {
-      case (nodeId, node) =>
-        (node ? QueryState).mapTo[NodeState]
-          .map(state => nodeId -> state)
-    }.map(_.toMap)
-  }
-
+  
   "NodeActor" should "elect as a leader the first node that starts an election" in {
     implicit val actorSystem: ActorSystem = ActorSystem("test-system-1")
-    val allNodes: Map[NodeId, ActorRef] = {
-      val node0 = NodeActor.createActor(0, initialStateMachine(), 150.millis, 100.millis)
-      val node1 = NodeActor.createActor(1, initialStateMachine(), 275.millis, 100.millis)
-      val node2 = NodeActor.createActor(2, initialStateMachine(), 275.millis, 100.millis)
-      val node3 = NodeActor.createActor(3, initialStateMachine(), 275.millis, 100.millis)
-      val node4 = NodeActor.createActor(4, initialStateMachine(), 300.millis, 100.millis)
-      Map(
-        0 -> node0,
-        1 -> node1,
-        2 -> node2,
-        3 -> node3,
-        4 -> node4
-      )
-    }
-    allNodes.foreach {
-      case (id, node) =>
-        node ! SetNodesInfo(allNodes.filter { case (nodeId, _) => nodeId != id })
-    }
-    Thread.sleep(750)
     implicit val ec = actorSystem.dispatcher
-    implicit val timeout = Timeout(100.millis)
+    val nodes = setupSimpleNodeSystem()
+    Thread.sleep(750)
 
-    getNodesState(allNodes).onComplete {
-      case Success(states) =>
-        actorSystem.shutdown()
-        verifySingleLeaderAndFollowers(states) should equal(true)
-      case Failure(err) =>
-        err.printStackTrace()
-        actorSystem.shutdown()
-        fail()
+
+    whenReady(
+      for {
+        state <- getNodesState(nodes)
+        _ <- actorSystem.terminate()
+      } yield state
+    ){ state =>
+      verifySingleLeaderAndFollowers(state) should equal(true)
+      verifyAllInSameTerm(state, term = 1) should equal(true)
+    }
+
+  }  
+
+  it should "elect a new leader after a leader failure" in {
+    implicit val actorSystem = ActorSystem("test-system-2")
+    implicit val ec = actorSystem.dispatcher
+    val nodes = setupSimpleNodeSystem()
+    Thread.sleep(750)
+    val afterMakingLeaderFail = for {
+      state <- getNodesState(nodes)
+    } yield makeLeadersFail(nodes, state, verifyNumberOfLeaders = Some(1))
+    val afterWaitingElection = afterMakingLeaderFail.map { _ =>
+      Thread.sleep(750)
+    }
+    val stateAfterFailureF = for {
+      _ <- afterWaitingElection
+      state <- getNodesState(nodes)
+      _ <- actorSystem.terminate()
+    } yield state
+
+    whenReady(stateAfterFailureF) { state =>
+      val leaders = findLeaders(state)
+      leaders.size should equal(1)
+      val (newLeaderId,newLeaderState) = leaders.head
+      newLeaderState.term should equal (2)
+      state.forall {
+        case (_,Follower(leaderIdOpt, followerTerm)) =>
+          leaderIdOpt == Some(newLeaderId) &&
+          newLeaderState.term == followerTerm
+        case (_,Candidate(_,_)) =>
+          false
+        case _ =>
+          true
+      } should equal(true)
     }
   }
+
 }
