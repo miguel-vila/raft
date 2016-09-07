@@ -29,7 +29,7 @@ trait TestUtils {
         )
     }
 
-  def setupSimpleNodeSystem()(implicit actorSystem: ActorSystem): Nodes = {
+  def setupSimpleNodeSystem()(implicit actorSystem: ActorSystem): (Nodes, ActorNetwork[Int]) = {
     val requestTimeout = 150.millis
     val node0 = NodeActor.createActor(0, initialStateMachine(), 150.millis, 100.millis, requestTimeout, s"node0")
     val node1 = NodeActor.createActor(1, initialStateMachine(), 225.millis, 100.millis, requestTimeout, s"node1")
@@ -45,7 +45,7 @@ trait TestUtils {
     )
     val network = new ActorNetwork[Int](nodes)
     startNodes(nodes, network)
-    nodes
+    (nodes, network)
   }
 
   def getNodesState(nodes: Nodes)(implicit executionContext: ExecutionContext, timeout: Timeout): Future[ClusterState] = {

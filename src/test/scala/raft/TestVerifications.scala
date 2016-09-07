@@ -42,4 +42,23 @@ trait TestVerifications {
       case _ => false
     }
 
+  def findPartitions(state: ClusterState): Map[NodeId, List[NodeId]] = {
+    val leaders = findLeaders(state)
+    val leaderTerm = leaders.map { case (id,state) => id -> state.term }.toMap
+    val leadersIds = leaders.map { case (leaderId,_) => leaderId }
+    var partitions = leadersIds.map{ leaderId => leaderId -> List(leaderId) }.toMap
+    leadersIds.foreach { leaderId =>
+      state.foreach {
+        case (followerId, follower @ Follower(Some(_leaderId), term)) =>
+          if(_leaderId == leaderId) {
+            assert(term == leaderTerm(leaderId))
+            partitions = partitions.updated(leaderId, followerId :: partitions(leaderId) )
+          }
+        case _ =>
+      }
+    }
+    partitions
+  }
+
+
 }

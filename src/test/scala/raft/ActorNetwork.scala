@@ -53,7 +53,7 @@ class ActorNetwork[A](nodes: Map[NodeId, ActorRef])(implicit actorSystem: ActorS
     networkPartitions.contains( Math.min(nodeA,nodeB) -> Math.max(nodeA,nodeB) )
   }
 
-  def addNetworkPartition(nodeA: NodeId, nodeB: NodeId): Unit = {
+  def createNetworkPartition(nodeA: NodeId, nodeB: NodeId): Unit = {
     assert(nodeA != nodeB)
     networkPartitions.add( Math.min(nodeA,nodeB) -> Math.max(nodeA,nodeB) )
   }
