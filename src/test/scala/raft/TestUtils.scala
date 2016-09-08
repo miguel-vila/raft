@@ -8,6 +8,7 @@ import akka.pattern._
 
 trait TestUtils {
 
+  /*
   def getLeadersRefs(nodes: Nodes, state: ClusterState): List[(NodeId, ActorRef)] = {
     state.filter {
       case (_, Leader(_, _)) => true
@@ -20,12 +21,11 @@ trait TestUtils {
 
   def initialStateMachine(): IntNumberState = new IntNumberState()
 
-  def startNodes[A](nodes: Nodes, network: Network[A]): Unit =
+  def startNodes[A](nodes: Nodes): Unit =
     nodes.foreach {
       case (id, node) =>
         node ! SetNodesInfo(
-          nodes.keys.filter { case nodeId => nodeId != id }.toList,
-          network
+          nodes
         )
     }
 
@@ -43,8 +43,8 @@ trait TestUtils {
       3 -> node3,
       4 -> node4
     )
+    startNodes(nodes)
     val network = new ActorNetwork[Int](nodes)
-    startNodes(nodes, network)
     (nodes, network)
   }
 
@@ -77,5 +77,6 @@ trait TestUtils {
         makeNodeFail(nodeRef)
     }
   }
+   */
 
 }

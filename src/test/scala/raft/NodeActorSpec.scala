@@ -11,6 +11,7 @@ import scala.util.{ Failure, Success }
 
 class NodeActorSpec extends FlatSpec with Matchers with ScalaFutures with TestUtils with TestVerifications {
 
+  /*
   implicit val timeout = Timeout(100.millis)
   implicit val patience = PatienceConfig(timeout = Span(1, Seconds), interval = Span(5, Millis))
 
@@ -108,5 +109,6 @@ class NodeActorSpec extends FlatSpec with Matchers with ScalaFutures with TestUt
       
     }
   }
+   */
 
 }

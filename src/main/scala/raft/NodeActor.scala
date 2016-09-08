@@ -1,6 +1,6 @@
 package raft
 
-import akka.actor.{ Actor, ActorLogging, ActorRef, ActorSystem, Cancellable, Props, Stash }
+import akka.actor.{ Actor, ActorLogging, ActorRef, ActorSelection, ActorSystem, Cancellable, Props, Stash }
 import scala.concurrent.Future
 import scala.concurrent.duration.{ Duration, FiniteDuration }
 import akka.pattern._
@@ -48,9 +48,7 @@ class NodeActor[A, B](
   /*
    * State
    */
-
-  var nodesIds: List[NodeId] = _
-  var network: Network[A] = _
+  var nodes: Map[NodeId, ActorSelection] = _
 
   var currentTerm: Term = 0 //should be persistent
   var votedFor: Option[NodeId] = None //should be persistent
@@ -78,8 +76,7 @@ class NodeActor[A, B](
 
   val waitingForNodesInfo: Receive = {
     case setNodesInfo: SetNodesInfo[A] =>
-      nodesIds = setNodesInfo.nodesIds
-      network = setNodesInfo.network
+      nodes = setNodesInfo.nodes
       unstashAll()
       context.become(startupState())
     case QueryState =>
@@ -104,7 +101,7 @@ class NodeActor[A, B](
       handleHeartbeat(leaderId, appendEntries)
     case appendEntries: AppendEntriesRPC[A] =>
       if (appendEntries.term < currentTerm || !checkConsistencyCondition(appendEntries)) {
-        network.respond(sender(), AppendEntriesResponse(term = currentTerm, success = false))
+        sender() ! AppendEntriesResponse(term = currentTerm, success = false)
       } else {
         resetElectionTimeout() // @TODO should also reset in the previous clause
         val conflictPoint = getConflictPoint(appendEntries)
@@ -166,12 +163,12 @@ class NodeActor[A, B](
       }
     case append: AppendEntryClientRequest[A] =>
       val uncommitedLogIndex = appendUncommitted(append.entry)
-      Future.traverse(nodesIds) {
-        case otherNodeId =>
+      Future.traverse(nodes) {
+        case (otherNodeId,_) =>
           context.become(leaderWaitingForFollowerResponses(nextIndex))
           val nodeEntries = entriesLog.drop(logIndex) // @TODO check for off-by-one error
           //if (nextIndex(otherNodeId) <= logIndex) { // @TODO uncomment
-          network.ask(otherNodeId, AppendEntriesRPC(
+          (nodes(otherNodeId) ? AppendEntriesRPC(
             term = currentTerm,
             leaderId = otherNodeId,
             prevLogIndex = nextIndex(otherNodeId),
@@ -222,7 +219,7 @@ class NodeActor[A, B](
   def leaderWaitingForFollowerResponses(nextIndex: Map[Int, Long]): Receive = {
     case responses: AppendEntriesFollowersResponse =>
       val positiveResponses = responses.positiveResponses()
-      if(positiveResponses.size > nodesIds.size / 2) {
+      if(positiveResponses.size > nodes.size / 2) {
         commitEntriesUpTo(responses.uncommiteEntry)
       }
       unstashAll()
@@ -289,7 +286,7 @@ class NodeActor[A, B](
       case Some(currentLeader) if currentLeader == appendEntries.leaderId =>
         log.info(s"Node $nodeId received heartbeat from previous leader $appendEntries.leaderId, staying the same")
         resetElectionTimeout()
-        network.respond(sender() , AppendEntriesResponse(term = currentTerm, true))
+        sender() ! AppendEntriesResponse(term = currentTerm, true)
       case _ =>
         if (appendEntries.term >= currentTerm /* && checkConsistencyCondition(appendEntries)*/ ) {
           currentTerm = appendEntries.term
@@ -297,9 +294,9 @@ class NodeActor[A, B](
           log.info(s"Node $nodeId received heartbeat from a new leader $appendEntries.leaderId, setting leaderId")
           votedFor = None
           context.become(follower(leaderId = Some(appendEntries.leaderId)))
-          network.respond(sender() , AppendEntriesResponse(term = currentTerm, true))
+          sender() ! AppendEntriesResponse(term = currentTerm, true)
         } else {
-          network.respond(sender() , AppendEntriesResponse(term = currentTerm, false))
+          sender() ! AppendEntriesResponse(term = currentTerm, false)
         }
     }
   }
@@ -326,26 +323,26 @@ class NodeActor[A, B](
   }
 
   def requestVotes() = {
-    nodesIds foreach {
-      case otherNodeId =>
-        network.sendTo( otherNodeId,
+    nodes foreach {
+      case (otherNodeId,_) =>
+        nodes(otherNodeId) !
           RequestVoteRPC(
             term = currentTerm,
             candidateId = nodeId,
             lastLogIndex = lastLogIndex,
             lastLogTerm = lastLogTerm
           )
-        )
+        
     }
   }
 
   def verifyMajorityOfVotes(votesGranted: Int) = {
     log.info(s"Node $nodeId verifying majority of the votes: votes granted = $votesGranted")
-    if (votesGranted > nodesIds.size / 2) { //@TODO verify if this is the correct predicate
+    if (votesGranted > nodes.size / 2) { //@TODO verify if this is the correct predicate
       log.info(s"Node $nodeId got majority of votes, becoming leader")
       cancelElectionTimeout()
       startHeartbeatMessages()
-      val nextIndex: Map[NodeId, LogIndex] = nodesIds.map(nodeId => nodeId -> (lastLogIndex + 1) ).toMap
+      val nextIndex: Map[NodeId, LogIndex] = nodes.map { case (nodeId,_) => nodeId -> (lastLogIndex + 1) }.toMap
       context.become(leader(nextIndex = nextIndex))
     } else {
       context.become(candidate(votesGranted))
@@ -354,9 +351,9 @@ class NodeActor[A, B](
 
   def sendLeaderHeartBeats() = {
     log.info(s"Node $nodeId sending leader heartbeats to other nodes")
-    nodesIds foreach {
-      case otherNodeId =>
-        network.sendTo(otherNodeId,
+    nodes foreach {
+      case (otherNodeId,_) =>
+        nodes(otherNodeId) !
           Heartbeat(
             term = currentTerm,
             leaderId = nodeId,
@@ -364,7 +361,7 @@ class NodeActor[A, B](
             prevLogTerm = lastLogTerm,
             leaderCommit = commitIndex
           ) //@TODO verify parameter values
-        )
+
     }
   }
 
@@ -384,23 +381,23 @@ class NodeActor[A, B](
       votedFor match {
         case Some(previousVote) =>
           log.info(s"Node $nodeId rejecting vote for node ${requestVote.candidateId} for term $currentTerm because already voted for $previousVote")
-          network.respond(candidate, RequestVoteResponse(currentTerm, false))
+          candidate ! RequestVoteResponse(currentTerm, false)
         case None =>
           log.info(s"Verifying if $nodeId's log is up to date with respect to ${requestVote.candidateId}")
           if (logIsAtLeastUpToDate(requestVote.lastLogIndex, requestVote.lastLogTerm)) {
             log.info(s"$nodeId's log is up to date w.r.t ${requestVote.candidateId}")
             resetElectionTimeout() // @TODO is this the correct place for this?
             log.info(s"Node $nodeId voting for node ${requestVote.candidateId} for term $currentTerm")
-            network.respond(candidate, RequestVoteResponse(currentTerm, true))
+            candidate ! RequestVoteResponse(currentTerm, true)
             votedFor = Some(requestVote.candidateId)
           } else {
             log.info(s"Node $nodeId rejecting vote for node ${requestVote.candidateId} for term $currentTerm because logs are not up to date")
-            network.respond(candidate, RequestVoteResponse(currentTerm, false))
+            candidate ! RequestVoteResponse(currentTerm, false)
           }
       }
     } else {
       log.info(s"Node $nodeId rejecting vote for node ${requestVote.candidateId} for term $currentTerm because candidate's term is old")
-      network.respond(candidate, RequestVoteResponse(currentTerm, false))
+      candidate ! RequestVoteResponse(currentTerm, false)
     }
   }
 
@@ -418,5 +415,5 @@ class NodeActor[A, B](
 }
 
 //@TODO move this to another place
-case class SetNodesInfo[A](nodesIds: List[NodeId], network: Network[A])
+case class SetNodesInfo[A](nodes: Nodes)
 case object QueryState
